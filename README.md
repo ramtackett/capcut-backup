@@ -51,6 +51,11 @@ TO BACKUP:
 
 WSL -> python3 backup_capcut.py
 
+* confirm files got backed up
+* Edit files_to_delete_*.py to remove any file references you want preserved on the phone
+* python3 files_to_delete_YYYYMMDD_HHMM.py # deletes files off of the Android phone
+
 TO RESTORE: 
 
 WSL -> restore.sh # chmod +x first
+
