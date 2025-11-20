@@ -1,0 +1,12 @@
+# Never commit real env file
+.env
+
+# Python noise
+__pycache__/
+*.pyc
+
+# Optional logs
+*.log
+
+# Files to delete off phone
+files_to_delete_*.py
