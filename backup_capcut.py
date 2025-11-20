@@ -213,35 +213,35 @@ def backup_capcut_data(adb_path: str, phone_capcut_dir: str, run_dir: str):
     else:
         print("[OK] CapCut data backed up to", capcut_parent_wsl)
 
-# def backup_media_dirs(adb_path: str, media_dirs: List[str], run_dir: str):
-    # """
-    # For each e.g. /sdcard/DCIM/Camera, pulls into:
-      # <run_dir>/media/Camera/...
-    # """
-    # media_parent_wsl = os.path.join(run_dir, "media")
-    # os.makedirs(media_parent_wsl, exist_ok=True)
+def backup_media_dirs(adb_path: str, media_dirs: List[str], run_dir: str):
+    """
+    For each e.g. /sdcard/DCIM/Camera, pulls into:
+      <run_dir>/media/Camera/...
+    """
+    media_parent_wsl = os.path.join(run_dir, "media")
+    os.makedirs(media_parent_wsl, exist_ok=True)
 
-    # try:
-        # media_parent_win = wsl_to_win_path(media_parent_wsl)
-    # except ValueError as e:
-        # print(f"[PATH CONVERT FAIL] {e}")
-        # return
+    try:
+        media_parent_win = wsl_to_win_path(media_parent_wsl)
+    except ValueError as e:
+        print(f"[PATH CONVERT FAIL] {e}")
+        return
 
-    # for phone_dir in media_dirs:
-        # phone_dir = phone_dir.rstrip("/")
-        # name = os.path.basename(phone_dir)
-        # if not name:
-            # print(f"[SKIP] Invalid media dir: {phone_dir}")
-            # continue
+    for phone_dir in media_dirs:
+        phone_dir = phone_dir.rstrip("/")
+        name = os.path.basename(phone_dir)
+        if not name:
+            print(f"[SKIP] Invalid media dir: {phone_dir}")
+            continue
 
-        # print(f"[STEP] Backing up media from {phone_dir} ...")
-        # # adb pull /sdcard/DCIM/Camera  <run_dir>/media (Windows path)
-        # result = run_adb(adb_path, ["pull", phone_dir, media_parent_win])
-        # if result.returncode != 0:
-            # print(f"[WARN] Media backup may have failed for {phone_dir}:")
-            # print(result.stderr.strip())
-        # else:
-            # print(f"[OK] Media from {phone_dir} backed up under {media_parent_wsl}")
+        print(f"[STEP] Backing up media from {phone_dir} ...")
+        # adb pull /sdcard/DCIM/Camera  <run_dir>/media (Windows path)
+        result = run_adb(adb_path, ["pull", phone_dir, media_parent_win])
+        if result.returncode != 0:
+            print(f"[WARN] Media backup may have failed for {phone_dir}:")
+            print(result.stderr.strip())
+        else:
+            print(f"[OK] Media from {phone_dir} backed up under {media_parent_wsl}")
 
 
 def main():
@@ -259,7 +259,7 @@ def main():
 
     run_dir = create_run_directory(backup_root)
 
-    backup_capcut_data(adb_path, phone_capcut_dir, run_dir)
+    # backup_capcut_data(adb_path, phone_capcut_dir, run_dir)
 
     if media_dirs:
         backup_media_dirs(adb_path, media_dirs, run_dir)
