@@ -104,6 +104,42 @@ def generate_delete_script(media_files: List[str]) -> None:
     print(f"[GENERATED] Delete script: {script_path}")
     print("           (Run this later *after* verifying your backup.)")
 
+def backup_portodb_dbs(adb_path: str, portodb_dir: str | None, run_dir: str) -> None:
+    """
+    Back up PortoDB SQLite databases from the phone using adb.
+
+    By default, we expect the databases to live under something like:
+      /sdcard/Android/data/com.portofarina.portodb/files/PortoDB
+
+    We copy that directory into:
+      <run_dir>/portodb/PortoDB/...
+
+    If PORTODB_DB_DIR is not set in .env, this is a no-op.
+    """
+    if not portodb_dir:
+        print("[INFO] PORTODB_DB_DIR not set; skipping PortoDB backup.")
+        return
+
+    phone_dir = portodb_dir.rstrip("/")
+    dest_parent_wsl = os.path.join(run_dir, "portodb")
+    os.makedirs(dest_parent_wsl, exist_ok=True)
+
+    try:
+        dest_parent_win = wsl_to_win_path(dest_parent_wsl)
+    except ValueError as e:
+        print(f"[PATH CONVERT FAIL] {e}")
+        return
+
+    print(f"[STEP] Backing up PortoDB SQLite DBs from {phone_dir} ...")
+
+    # Simple approach: pull the whole folder.
+    # adb pull /sdcard/Android/data/com.portofarina.portodb/files/PortoDB  <run_dir>/portodb
+    result = run_adb(adb_path, ["pull", phone_dir, dest_parent_win])
+    if result.returncode != 0:
+        print("[WARN] PortoDB backup may have failed:")
+        print(result.stderr.strip())
+    else:
+        print(f"[OK] PortoDB DBs backed up under {dest_parent_wsl}")
 
 
 def load_config():
@@ -113,6 +149,7 @@ def load_config():
     backup_root = os.getenv("BACKUP_ROOT_WSL")
     phone_capcut_dir = os.getenv("PHONE_CAPCUT_DIR", "/sdcard/Android/data/com.lemon.lvoverseas")
     media_dirs_raw = os.getenv("PHONE_MEDIA_DIRS", "")
+    portodb_dir = os.getenv("PORTODB_DB_DIR")
 
     if not adb_path:
         raise SystemExit("[ERROR] ADB_PATH_WSL not set in .env")
@@ -131,6 +168,7 @@ def load_config():
         "PHONE_CAPCUT_DIR": phone_capcut_dir.rstrip("/"),
         "PHONE_MEDIA_DIRS": media_dirs,
         "DOWNLOAD_IGNORE_PATTERNS": ignore_patterns,
+	"PORTODB_DB_DIR": portodb_dir,
     }
 
 # ----------------- ADB HELPERS ----------------- #
@@ -250,6 +288,7 @@ def main():
     backup_root = cfg["BACKUP_ROOT"]
     phone_capcut_dir = cfg["PHONE_CAPCUT_DIR"]
     media_dirs = cfg["PHONE_MEDIA_DIRS"]
+    portodb_dir = cfg["PORTODB_DB_DIR"]
 
     print("[CHECK] adb devices")
     devices = run_adb(adb_path, ["devices"]).stdout
@@ -265,6 +304,10 @@ def main():
         backup_media_dirs(adb_path, media_dirs, run_dir)
     else:
         print("[INFO] No PHONE_MEDIA_DIRS specified; skipping media backup.")
+        media_dirs = []
+
+    # NEW: PortoDB SQLite databases
+    backup_portodb_dbs(adb_path, portodb_dir, run_dir)
 
     # NEW: build delete script for original media on phone
     if media_dirs:
@@ -274,7 +317,7 @@ def main():
     else:
         print("[INFO] No media dirs configured; skipping delete script generation.")
 
-    print("[DONE] CapCut backup complete.")
+    print("[DONE] backup complete.")
     print("       Run directory:", run_dir)
 
 if __name__ == "__main__":
