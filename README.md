@@ -46,6 +46,8 @@ BACKUP_ROOT_WSL=/mnt/c/Users/USER_NAME/Documents/CapCutBackups
 
 PHONE_MEDIA_DIRS=/sdcard/DCIM/Camera,/sdcard/Pictures,/sdcard/Movies,/sdcard/Download
 
+PORTODB_DB_DIR=/sdcard/Android/data/com.portofarina.portodb/files/PortoDB
+
 ---
 TO BACKUP: 
 
@@ -58,4 +60,5 @@ WSL -> python3 backup_capcut.py
 TO RESTORE: 
 
 WSL -> restore.sh # chmod +x first
+
 
