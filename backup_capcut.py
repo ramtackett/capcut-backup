@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import os
 import subprocess
 from datetime import datetime
@@ -283,6 +284,17 @@ def backup_media_dirs(adb_path: str, media_dirs: List[str], run_dir: str):
 
 
 def main():
+    # ---------------------------
+    # Command-line parameter
+    # ---------------------------
+    parser = argparse.ArgumentParser(description="Android backup script")
+    parser.add_argument(
+        "--skip-portodb",
+        action="store_true",
+        help="Skip backing up PortoDB SQLite databases"
+    )
+    args = parser.parse_args()
+
     cfg = load_config()
     adb_path = cfg["ADB_PATH"]
     backup_root = cfg["BACKUP_ROOT"]
@@ -299,6 +311,12 @@ def main():
     run_dir = create_run_directory(backup_root)
 
     # backup_capcut_data(adb_path, phone_capcut_dir, run_dir)
+    if not args.skip_portodb:
+        backup_portodb_dbs(adb_path, portodb_dir, run_dir)
+    else:
+        print("[INFO] --skip-portodb enabled; skipping PortoDB backup.")
+ 
+
 
     if media_dirs:
         backup_media_dirs(adb_path, media_dirs, run_dir)
