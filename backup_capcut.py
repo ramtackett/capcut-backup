@@ -1,28 +1,16 @@
 #!/usr/bin/env python3
-import argparse
 import os
 import subprocess
+import argparse
+import shlex
+import fnmatch
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 from dotenv import load_dotenv
 
-import fnmatch
 
-# ----------------- ENV LOADING ----------------- #
-
-def should_ignore_download_file(path: str, ignore_patterns: List[str]) -> bool:
-    """
-    Returns True if the file path matches any ignore pattern.
-    Patterns use Unix shell matching: *.zip, junk*, etc.
-    """
-    filename = os.path.basename(path)
-    for pat in ignore_patterns:
-        if fnmatch.fnmatch(filename, pat):
-            return True
-    return False
-
-
+# ----------------- PATH HELPERS ----------------- #
 
 def wsl_to_win_path(wsl_path: str) -> str:
     """
@@ -42,14 +30,224 @@ def wsl_to_win_path(wsl_path: str) -> str:
     rest = parts[3:]                 # ['Users','rtackett',...]
     return drive_letter + ":\\" + "\\".join(rest)
 
-import shlex
 
-def shell_escape(path: str) -> str:
+# ----------------- ENV LOADING ----------------- #
+
+def load_config():
+    load_dotenv()
+
+    adb_path = os.getenv("ADB_PATH_WSL")
+    backup_root = os.getenv("BACKUP_ROOT_WSL")
+
+    phone_capcut_dir = os.getenv(
+        "PHONE_CAPCUT_DIR",
+        "/sdcard/Android/data/com.lemon.lvoverseas"
+    )
+
+    media_dirs_raw = os.getenv("PHONE_MEDIA_DIRS", "")
+    media_dirs = [m.strip() for m in media_dirs_raw.split(",") if m.strip()]
+
+    portodb_dir_raw = os.getenv("PORTODB_DB_DIR", "").strip()
+    portodb_dir: Optional[str] = portodb_dir_raw or None
+
+    download_ignore_raw = os.getenv("DOWNLOAD_IGNORE_PATTERNS", "")
+    download_ignore_patterns = [
+        p.strip() for p in download_ignore_raw.split(",") if p.strip()
+    ]
+
+    if not adb_path:
+        raise SystemExit("[ERROR] ADB_PATH_WSL not set in .env")
+    if not backup_root:
+        raise SystemExit("[ERROR] BACKUP_ROOT_WSL not set in .env")
+
+    return {
+        "ADB_PATH": adb_path,
+        "BACKUP_ROOT": backup_root,
+        "PHONE_CAPCUT_DIR": phone_capcut_dir.rstrip("/"),
+        "PHONE_MEDIA_DIRS": media_dirs,
+        "PORTODB_DB_DIR": portodb_dir,
+        "DOWNLOAD_IGNORE_PATTERNS": download_ignore_patterns,
+    }
+
+
+# ----------------- ADB HELPERS ----------------- #
+
+def run_adb(adb_path: str, args: List[str], check: bool = False) -> subprocess.CompletedProcess:
+    cmd = [adb_path] + args
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, check=check)
+    except FileNotFoundError:
+        raise SystemExit(
+            f"[ERROR] adb executable not found at {adb_path}\n"
+            "Check ADB_PATH_WSL in your .env and verify the path in WSL matches where adb.exe lives on Windows."
+        )
+
+
+def adb_shell(adb_path: str, cmd: str) -> str:
+    result = run_adb(adb_path, ["shell", cmd])
+    if result.stderr.strip():
+        print("[ADB STDERR]", result.stderr.strip())
+    return result.stdout
+
+
+# ----------------- BACKUP HELPERS ----------------- #
+
+def create_run_directory(backup_root: str) -> str:
+    now = datetime.now()
+    yyyy = f"{now.year:04d}"
+    mm = f"{now.month:02d}"
+    dd = f"{now.day:02d}"
+    run_ts = now.strftime("%H%M")
+
+    run_dir = os.path.join(backup_root, yyyy, mm, dd, run_ts)
+    os.makedirs(run_dir, exist_ok=True)
+    print(f"[RUN] Backup root for this run: {run_dir}")
+    return run_dir
+
+
+def backup_capcut_data(adb_path: str, phone_capcut_dir: str, run_dir: str) -> None:
     """
-    Escape an Android shell path safely for use in rm commands.
-    Uses shlex.quote() which safely handles spaces, quotes, parentheses, etc.
+    Pull /sdcard/Android/data/com.lemon.lvoverseas into:
+      <run_dir>/capcut_app/com.lemon.lvoverseas/...
     """
-    return shlex.quote(path)
+    if not phone_capcut_dir:
+        print("[INFO] PHONE_CAPCUT_DIR not set; skipping CapCut app data backup.")
+        return
+
+    capcut_parent_wsl = os.path.join(run_dir, "capcut_app")
+    os.makedirs(capcut_parent_wsl, exist_ok=True)
+
+    try:
+        capcut_parent_win = wsl_to_win_path(capcut_parent_wsl)
+    except ValueError as e:
+        print(f"[PATH CONVERT FAIL] {e}")
+        return
+
+    print(f"[STEP] Backing up CapCut app data from {phone_capcut_dir} ...")
+    result = run_adb(adb_path, ["pull", phone_capcut_dir, capcut_parent_win])
+    if result.returncode != 0:
+        print("[WARN] CapCut data backup may have failed:")
+        print(result.stderr.strip())
+    else:
+        print("[OK] CapCut data backed up to", capcut_parent_wsl)
+
+
+def should_ignore_download_file(path: str, ignore_patterns: List[str]) -> bool:
+    """
+    Returns True if the basename of 'path' matches any ignore pattern.
+    """
+    filename = os.path.basename(path)
+    for pat in ignore_patterns:
+        if fnmatch.fnmatch(filename, pat):
+            return True
+    return False
+
+
+def backup_media_dirs(
+    adb_path: str,
+    media_dirs: List[str],
+    run_dir: str,
+    download_ignore_patterns: List[str]
+) -> None:
+    """
+    For each media dir (e.g. /sdcard/DCIM/Camera, /sdcard/Pictures, /sdcard/Download),
+    back up contents into:
+        <run_dir>/media/<Name>/...
+
+    - Camera/Pictures/Movies/etc. use bulk adb pull.
+    - Download is treated specially: we honor DOWNLOAD_IGNORE_PATTERNS
+      and skip matching files.
+    """
+    media_parent_wsl = os.path.join(run_dir, "media")
+    os.makedirs(media_parent_wsl, exist_ok=True)
+
+    try:
+        media_parent_win = wsl_to_win_path(media_parent_wsl)
+    except ValueError as e:
+        print(f"[PATH CONVERT FAIL] {e}")
+        return
+
+    for phone_dir in media_dirs:
+        phone_dir = phone_dir.rstrip("/")
+        name = os.path.basename(phone_dir)
+
+        if not name:
+            print(f"[SKIP] Invalid media dir: {phone_dir}")
+            continue
+
+        # --- Special handling for Download --- #
+        if name.lower() == "download" and download_ignore_patterns:
+            print(f"[STEP] Backing up filtered Download media from {phone_dir} ...")
+            out = adb_shell(adb_path, f"find {phone_dir} -type f 2>/dev/null")
+            all_files = [line.strip() for line in out.splitlines() if line.strip()]
+
+            files_to_copy = [
+                f for f in all_files
+                if not should_ignore_download_file(f, download_ignore_patterns)
+            ]
+            ignored_files = [f for f in all_files if f not in files_to_copy]
+
+            print(f"[DOWNLOAD] {len(all_files)} files total, "
+                  f"{len(files_to_copy)} after ignore rules.")
+            if ignored_files:
+                print("[DOWNLOAD] Ignoring:")
+                for f in ignored_files:
+                    print("   ", f)
+
+            for f in files_to_copy:
+                # Preserve subdirectory structure under Download
+                if f.startswith(phone_dir + "/"):
+                    rel = f[len(phone_dir) + 1:]
+                else:
+                    rel = os.path.basename(f)
+
+                rel_dir = os.path.dirname(rel)
+                filename = os.path.basename(rel)
+
+                dest_dir_wsl = os.path.join(media_parent_wsl, "Download", rel_dir)
+                os.makedirs(dest_dir_wsl, exist_ok=True)
+
+                try:
+                    dest_dir_win = wsl_to_win_path(dest_dir_wsl)
+                except ValueError as e:
+                    print(f"[PATH CONVERT FAIL] {e}")
+                    continue
+
+                print(f"[COPY] {f} -> {dest_dir_win}")
+                result = run_adb(adb_path, ["pull", f, dest_dir_win])
+                if result.returncode != 0:
+                    print(f"[WARN] Failed to copy {f}: {result.stderr.strip()}")
+
+            continue  # Skip bulk pull for Download
+
+        # --- Default bulk handling for other media dirs --- #
+        print(f"[STEP] Backing up media from {phone_dir} ...")
+        result = run_adb(adb_path, ["pull", phone_dir, media_parent_win])
+        if result.returncode != 0:
+            print(f"[WARN] Media backup may have failed for {phone_dir}:")
+            print(result.stderr.strip())
+        else:
+            print(f"[OK] Media from {phone_dir} backed up under {media_parent_wsl}")
+
+
+def list_media_files_for_delete(adb_path: str, media_dirs: List[str]) -> List[str]:
+    """
+    For each media dir, list all files to include in the delete script.
+    """
+    all_files: List[str] = []
+    for phone_dir in media_dirs:
+        phone_dir = phone_dir.rstrip("/")
+        if not phone_dir:
+            continue
+        print(f"[SCAN] Listing files for delete under {phone_dir} ...")
+        out = adb_shell(adb_path, f"find {phone_dir} -type f 2>/dev/null")
+        for line in out.splitlines():
+            p = line.strip()
+            if p:
+                all_files.append(p)
+    print(f"[INFO] Collected {len(all_files)} media files for potential deletion.")
+    return all_files
+
 
 def generate_delete_script(media_files: List[str]) -> None:
     """
@@ -64,7 +262,7 @@ def generate_delete_script(media_files: List[str]) -> None:
     filename = f"files_to_delete_{timestamp}.py"
     script_path = os.path.join(os.getcwd(), filename)
 
-    lines = []
+    lines: List[str] = []
     lines.append("import os")
     lines.append("import subprocess")
     lines.append("from dotenv import load_dotenv")
@@ -87,7 +285,7 @@ def generate_delete_script(media_files: List[str]) -> None:
     lines.append("def main():")
     lines.append("    import shlex")
     lines.append("    for path in PHONE_FILES:")
-    lines.append("        esc = shlex.quote(path)")  # SAFE
+    lines.append("        esc = shlex.quote(path)")
     lines.append("        print(f'Deleting {path} ...')")
     lines.append("        run_adb(['shell', f\"rm -f {esc}\"])")
     lines.append("")
@@ -105,17 +303,16 @@ def generate_delete_script(media_files: List[str]) -> None:
     print(f"[GENERATED] Delete script: {script_path}")
     print("           (Run this later *after* verifying your backup.)")
 
-def backup_portodb_dbs(adb_path: str, portodb_dir: str | None, run_dir: str) -> None:
+
+def backup_portodb_dbs(adb_path: str, portodb_dir: Optional[str], run_dir: str) -> None:
     """
     Back up PortoDB SQLite databases from the phone using adb.
 
-    By default, we expect the databases to live under something like:
+    Expected default location (set in .env):
       /sdcard/Android/data/com.portofarina.portodb/files/PortoDB
 
-    We copy that directory into:
+    They are copied into:
       <run_dir>/portodb/PortoDB/...
-
-    If PORTODB_DB_DIR is not set in .env, this is a no-op.
     """
     if not portodb_dir:
         print("[INFO] PORTODB_DB_DIR not set; skipping PortoDB backup.")
@@ -132,9 +329,6 @@ def backup_portodb_dbs(adb_path: str, portodb_dir: str | None, run_dir: str) -> 
         return
 
     print(f"[STEP] Backing up PortoDB SQLite DBs from {phone_dir} ...")
-
-    # Simple approach: pull the whole folder.
-    # adb pull /sdcard/Android/data/com.portofarina.portodb/files/PortoDB  <run_dir>/portodb
     result = run_adb(adb_path, ["pull", phone_dir, dest_parent_win])
     if result.returncode != 0:
         print("[WARN] PortoDB backup may have failed:")
@@ -143,151 +337,11 @@ def backup_portodb_dbs(adb_path: str, portodb_dir: str | None, run_dir: str) -> 
         print(f"[OK] PortoDB DBs backed up under {dest_parent_wsl}")
 
 
-def load_config():
-    load_dotenv()
-
-    adb_path = os.getenv("ADB_PATH_WSL")
-    backup_root = os.getenv("BACKUP_ROOT_WSL")
-    phone_capcut_dir = os.getenv("PHONE_CAPCUT_DIR", "/sdcard/Android/data/com.lemon.lvoverseas")
-    media_dirs_raw = os.getenv("PHONE_MEDIA_DIRS", "")
-    portodb_dir = os.getenv("PORTODB_DB_DIR")
-
-    if not adb_path:
-        raise SystemExit("[ERROR] ADB_PATH_WSL not set in .env")
-    if not backup_root:
-        raise SystemExit("[ERROR] BACKUP_ROOT_WSL not set in .env")
-
-    media_dirs = [m.strip() for m in media_dirs_raw.split(",") if m.strip()]
-
-    ignore_raw = os.getenv("DOWNLOAD_IGNORE_PATTERNS", "")
-    ignore_patterns = [p.strip() for p in ignore_raw.split(",") if p.strip()]
-
-
-    return {
-        "ADB_PATH": adb_path,
-        "BACKUP_ROOT": backup_root,
-        "PHONE_CAPCUT_DIR": phone_capcut_dir.rstrip("/"),
-        "PHONE_MEDIA_DIRS": media_dirs,
-        "DOWNLOAD_IGNORE_PATTERNS": ignore_patterns,
-	"PORTODB_DB_DIR": portodb_dir,
-    }
-
-# ----------------- ADB HELPERS ----------------- #
-
-def run_adb(adb_path: str, args: List[str], check: bool = False) -> subprocess.CompletedProcess:
-    cmd = [adb_path] + args
-    try:
-        return subprocess.run(cmd, capture_output=True, text=True, check=check)
-    except FileNotFoundError:
-        raise SystemExit(
-            f"[ERROR] adb executable not found at {adb_path}\n"
-            "Check ADB_PATH_WSL in your .env and verify the path in WSL matches where adb.exe lives on Windows."
-        )
-
-def adb_shell(adb_path: str, cmd: str) -> str:
-    result = run_adb(adb_path, ["shell", cmd])
-    if result.stderr.strip():
-        print("[ADB STDERR]", result.stderr.strip())
-    return result.stdout
-
-def list_media_files_for_delete(adb_path: str, media_dirs: List[str]) -> List[str]:
-    """
-    For each media dir (e.g. /sdcard/DCIM/Camera), use adb shell find
-    to list all files to include in the delete script.
-    Returns a list of full phone paths.
-    """
-    all_files: List[str] = []
-
-    for phone_dir in media_dirs:
-        phone_dir = phone_dir.rstrip("/")
-        if not phone_dir:
-            continue
-
-        print(f"[SCAN] Listing files for delete under {phone_dir} ...")
-        out = adb_shell(adb_path, f"find {phone_dir} -type f 2>/dev/null")
-        for line in out.splitlines():
-            p = line.strip()
-            if p:
-                all_files.append(p)
-
-    print(f"[INFO] Collected {len(all_files)} media files for potential deletion.")
-    return all_files
-
-
-# ----------------- BACKUP LOGIC ----------------- #
-
-def create_run_directory(backup_root: str) -> str:
-    now = datetime.now()
-    date_yyyy = f"{now.year:04d}"
-    date_mm = f"{now.month:02d}"
-    date_dd = f"{now.day:02d}"
-    run_timestamp = now.strftime("%H%M")  # 1902, etc.
-
-    run_dir = os.path.join(backup_root, date_yyyy, date_mm, date_dd, run_timestamp)
-    os.makedirs(run_dir, exist_ok=True)
-
-    print(f"[RUN] Backup root for this run: {run_dir}")
-    return run_dir
-
-def backup_capcut_data(adb_path: str, phone_capcut_dir: str, run_dir: str):
-    """
-    Pull /sdcard/Android/data/com.lemon.lvoverseas into:
-      <run_dir>/capcut_app/com.lemon.lvoverseas/...
-    """
-    capcut_parent_wsl = os.path.join(run_dir, "capcut_app")
-    os.makedirs(capcut_parent_wsl, exist_ok=True)
-
-    try:
-        capcut_parent_win = wsl_to_win_path(capcut_parent_wsl)
-    except ValueError as e:
-        print(f"[PATH CONVERT FAIL] {e}")
-        return
-
-    print(f"[STEP] Backing up CapCut app data from {phone_capcut_dir} ...")
-    # adb pull <phone_capcut_dir> <capcut_parent_win>
-    result = run_adb(adb_path, ["pull", phone_capcut_dir, capcut_parent_win])
-    if result.returncode != 0:
-        print("[WARN] CapCut data backup may have failed:")
-        print(result.stderr.strip())
-    else:
-        print("[OK] CapCut data backed up to", capcut_parent_wsl)
-
-def backup_media_dirs(adb_path: str, media_dirs: List[str], run_dir: str):
-    """
-    For each e.g. /sdcard/DCIM/Camera, pulls into:
-      <run_dir>/media/Camera/...
-    """
-    media_parent_wsl = os.path.join(run_dir, "media")
-    os.makedirs(media_parent_wsl, exist_ok=True)
-
-    try:
-        media_parent_win = wsl_to_win_path(media_parent_wsl)
-    except ValueError as e:
-        print(f"[PATH CONVERT FAIL] {e}")
-        return
-
-    for phone_dir in media_dirs:
-        phone_dir = phone_dir.rstrip("/")
-        name = os.path.basename(phone_dir)
-        if not name:
-            print(f"[SKIP] Invalid media dir: {phone_dir}")
-            continue
-
-        print(f"[STEP] Backing up media from {phone_dir} ...")
-        # adb pull /sdcard/DCIM/Camera  <run_dir>/media (Windows path)
-        result = run_adb(adb_path, ["pull", phone_dir, media_parent_win])
-        if result.returncode != 0:
-            print(f"[WARN] Media backup may have failed for {phone_dir}:")
-            print(result.stderr.strip())
-        else:
-            print(f"[OK] Media from {phone_dir} backed up under {media_parent_wsl}")
-
+# ----------------- MAIN ----------------- #
 
 def main():
-    # ---------------------------
-    # Command-line parameter
-    # ---------------------------
-    parser = argparse.ArgumentParser(description="Android backup script")
+    # CLI args
+    parser = argparse.ArgumentParser(description="Android media + CapCut + PortoDB backup script")
     parser.add_argument(
         "--skip-portodb",
         action="store_true",
@@ -301,33 +355,33 @@ def main():
     phone_capcut_dir = cfg["PHONE_CAPCUT_DIR"]
     media_dirs = cfg["PHONE_MEDIA_DIRS"]
     portodb_dir = cfg["PORTODB_DB_DIR"]
+    download_ignore_patterns = cfg["DOWNLOAD_IGNORE_PATTERNS"]
 
     print("[CHECK] adb devices")
     devices = run_adb(adb_path, ["devices"]).stdout
     print(devices.strip())
-    if "device" not in devices.splitlines()[-1:]:
+    # don't bail hard if no device line format is weird; just warn
+    if not any(line.strip().endswith("device") for line in devices.splitlines()[1:]):
         print("[WARN] No connected/authorized device detected. Make sure USB debugging is on and allowed.")
 
     run_dir = create_run_directory(backup_root)
 
+    # CapCut external data (optional)
     # backup_capcut_data(adb_path, phone_capcut_dir, run_dir)
+
+    # Media backup
+    if media_dirs:
+        backup_media_dirs(adb_path, media_dirs, run_dir, download_ignore_patterns)
+    else:
+        print("[INFO] No PHONE_MEDIA_DIRS specified; skipping media backup.")
+
+    # PortoDB (optional, controlled by CLI + env)
     if not args.skip_portodb:
         backup_portodb_dbs(adb_path, portodb_dir, run_dir)
     else:
-        print("[INFO] --skip-portodb enabled; skipping PortoDB backup.")
- 
+        print("[INFO] --skip-portodb flag enabled; skipping PortoDB backup.")
 
-
-    if media_dirs:
-        backup_media_dirs(adb_path, media_dirs, run_dir)
-    else:
-        print("[INFO] No PHONE_MEDIA_DIRS specified; skipping media backup.")
-        media_dirs = []
-
-    # NEW: PortoDB SQLite databases
-    backup_portodb_dbs(adb_path, portodb_dir, run_dir)
-
-    # NEW: build delete script for original media on phone
+    # Delete script (for media only)
     if media_dirs:
         print("[STEP] Collecting media file list for delete script...")
         media_files = list_media_files_for_delete(adb_path, media_dirs)
@@ -335,8 +389,9 @@ def main():
     else:
         print("[INFO] No media dirs configured; skipping delete script generation.")
 
-    print("[DONE] backup complete.")
+    print("[DONE] Backup complete.")
     print("       Run directory:", run_dir)
+
 
 if __name__ == "__main__":
     main()
