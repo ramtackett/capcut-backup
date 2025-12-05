@@ -4,8 +4,10 @@ import subprocess
 import argparse
 import shlex
 import fnmatch
+import json
+import hashlib
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 from dotenv import load_dotenv
 
@@ -224,7 +226,7 @@ def backup_media_dirs(
         print(f"[STEP] Backing up media from {phone_dir} ...")
         result = run_adb(adb_path, ["pull", phone_dir, media_parent_win])
         if result.returncode != 0:
-            print(f"[WARN] Media backup may have failed for {phone_dir}:")
+            print("[WARN] Media backup may have failed for {phone_dir}:")
             print(result.stderr.strip())
         else:
             print(f"[OK] Media from {phone_dir} backed up under {media_parent_wsl}")
@@ -304,7 +306,161 @@ def generate_delete_script(media_files: List[str]) -> None:
     print("           (Run this later *after* verifying your backup.)")
 
 
-def backup_portodb_dbs(adb_path: str, portodb_dir: Optional[str], run_dir: str) -> None:
+# ----------------- PORTODB SHA + DEDUPE HELPERS ----------------- #
+
+def compute_sha256(path: str) -> str:
+    """
+    Compute SHA256 for a file in a streaming-safe way.
+    """
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def write_sha256_file(portodb_root: str) -> Dict[str, str]:
+    """
+    Walk portodb_root and write SHA256.txt into that directory.
+    Returns a dict: relative_path_from_portodb_root -> sha256.
+    """
+    sha_map: Dict[str, str] = {}
+    sha_file_path = os.path.join(portodb_root, "SHA256.txt")
+
+    lines: List[str] = []
+
+    for root, dirs, files in os.walk(portodb_root):
+        for name in files:
+            full_path = os.path.join(root, name)
+
+            # Don't hash our own SHA file if re-run
+            if os.path.abspath(full_path) == os.path.abspath(sha_file_path):
+                continue
+
+            rel_path = os.path.relpath(full_path, portodb_root)
+            sha256 = compute_sha256(full_path)
+            sha_map[rel_path] = sha256
+            lines.append(f"{sha256}  {rel_path}")
+
+    with open(sha_file_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + ("\n" if lines else ""))
+
+    print(f"[OK] SHA256.txt written with {len(sha_map)} entries at {sha_file_path}")
+    return sha_map
+
+
+def load_portodb_log(log_path: str) -> Dict[str, str]:
+    if not os.path.exists(log_path):
+        return {}
+    try:
+        with open(log_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items()}
+        return {}
+    except Exception as e:
+        print(f"[WARN] Could not read existing PortoDB SHA log: {e}")
+        return {}
+
+
+def save_portodb_log(log_path: str, data: Dict[str, str]) -> None:
+    tmp_path = log_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+    os.replace(tmp_path, log_path)
+    print(f"[OK] PortoDB SHA log updated at {log_path}")
+
+
+def generate_portodb_delete_script(files_to_delete: List[str]) -> None:
+    """
+    Generate a timestamped Python script that deletes *destination* PortoDB
+    files whose SHA256 has not changed since last export.
+    """
+    if not files_to_delete:
+        print("[INFO] No unchanged PortoDB files this run; no delete script generated.")
+        return
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    filename = f"delete_unchanged_portodb_{timestamp}.py"
+    script_path = os.path.join(os.getcwd(), filename)
+
+    lines: List[str] = []
+    lines.append("import os")
+    lines.append("")
+    lines.append("FILES_TO_DELETE = [")
+    for p in files_to_delete:
+        lines.append(f"    r\"{p}\",")
+    lines.append("]")
+    lines.append("")
+    lines.append("def main():")
+    lines.append("    for path in FILES_TO_DELETE:")
+    lines.append("        if os.path.exists(path):")
+    lines.append("            print(f'Removing {path} ...')")
+    lines.append("            try:")
+    lines.append("                os.remove(path)")
+    lines.append("            except Exception as e:")
+    lines.append("                print(f'  [WARN] Failed to remove {path}: {e}')")
+    lines.append("        else:")
+    lines.append("            print(f'Skipping {path}; does not exist.')")
+    lines.append("")
+    lines.append("if __name__ == '__main__':")
+    lines.append("    confirm = input('Type DELETE PORTODB to remove unchanged destination PortoDB files: ')")
+    lines.append("    if confirm.strip() == 'DELETE PORTODB':")
+    lines.append("        main()")
+    lines.append("    else:")
+    lines.append("        print('Aborted; no deletions performed.')")
+    lines.append("")
+
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    print(f"[GENERATED] PortoDB dedupe delete script: {script_path}")
+    print("           (Run this to remove unchanged destination PortoDB files for this run.)")
+
+
+def process_portodb_hashes_and_dedupe(portodb_root: str, backup_root: str) -> None:
+    """
+    After PortoDB pull into portodb_root, generate SHA256.txt,
+    update the running log, and create a delete script for unchanged files.
+    """
+    if not os.path.isdir(portodb_root):
+        print(f"[INFO] PortoDB backup directory not found at {portodb_root}; skipping SHA/dedupe.")
+        return
+
+    # 1. Generate SHA256.txt for this run
+    current_map = write_sha256_file(portodb_root)
+
+    # 2. Load running log
+    log_path = os.path.join(backup_root, "portodb_sha_log.json")
+    old_log = load_portodb_log(log_path)
+
+    # 3. Determine which files are unchanged from last run
+    # Key: relative path from portodb_root (e.g. "PortoDB/mydb.sqlite")
+    # We track per relative path across runs.
+    unchanged_abs_paths: List[str] = []
+    new_log = dict(old_log)  # carry forward any existing entries
+
+    for rel_path, sha in current_map.items():
+        prev_sha = old_log.get(rel_path)
+        if prev_sha is not None and prev_sha == sha:
+            # unchanged file; mark this *new* copy for deletion
+            abs_path = os.path.join(portodb_root, rel_path)
+            unchanged_abs_paths.append(abs_path)
+
+        # update log with current hash
+        new_log[rel_path] = sha
+
+    # 4. Save updated log
+    save_portodb_log(log_path, new_log)
+
+    # 5. Generate per-run delete script for unchanged files
+    if unchanged_abs_paths:
+        print(f"[INFO] {len(unchanged_abs_paths)} PortoDB files unchanged since last export.")
+    generate_portodb_delete_script(unchanged_abs_paths)
+
+
+# ----------------- PORTODB BACKUP ----------------- #
+
+def backup_portodb_dbs(adb_path: str, portodb_dir: Optional[str], run_dir: str, backup_root: str) -> None:
     """
     Back up PortoDB SQLite databases from the phone using adb.
 
@@ -313,6 +469,11 @@ def backup_portodb_dbs(adb_path: str, portodb_dir: Optional[str], run_dir: str) 
 
     They are copied into:
       <run_dir>/portodb/PortoDB/...
+
+    After backup, we:
+      - generate SHA256.txt for all files under <run_dir>/portodb
+      - maintain a running SHA log under BACKUP_ROOT
+      - create a per-run delete script for unchanged destination files
     """
     if not portodb_dir:
         print("[INFO] PORTODB_DB_DIR not set; skipping PortoDB backup.")
@@ -333,8 +494,13 @@ def backup_portodb_dbs(adb_path: str, portodb_dir: Optional[str], run_dir: str) 
     if result.returncode != 0:
         print("[WARN] PortoDB backup may have failed:")
         print(result.stderr.strip())
-    else:
-        print(f"[OK] PortoDB DBs backed up under {dest_parent_wsl}")
+        # If backup failed, don't try to hash/dedupe
+        return
+
+    print(f"[OK] PortoDB DBs backed up under {dest_parent_wsl}")
+
+    # Now run SHA256 + dedupe logic on the backed-up tree
+    process_portodb_hashes_and_dedupe(dest_parent_wsl, backup_root)
 
 
 # ----------------- MAIN ----------------- #
@@ -377,11 +543,11 @@ def main():
 
     # PortoDB (optional, controlled by CLI + env)
     if not args.skip_portodb:
-        backup_portodb_dbs(adb_path, portodb_dir, run_dir)
+        backup_portodb_dbs(adb_path, portodb_dir, run_dir, backup_root)
     else:
         print("[INFO] --skip-portodb flag enabled; skipping PortoDB backup.")
 
-    # Delete script (for media only)
+    # Delete script (for media only, on the phone)
     if media_dirs:
         print("[STEP] Collecting media file list for delete script...")
         media_files = list_media_files_for_delete(adb_path, media_dirs)
